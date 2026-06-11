@@ -251,7 +251,7 @@ echo "deb [signed-by=/usr/share/keyrings/grafana.key] https://apt.grafana.com st
 sudo apt-get update
 sudo apt-get install -y grafana
 
-grafana-server -v
+grafana server -v
 ```
 
 ---
