@@ -365,6 +365,8 @@ promtail --version
 **Create config directory and positions directory:**
 ```bash
 sudo mkdir -p /etc/promtail /var/lib/promtail
+sudo chown -R promtail:promtail /var/lib/promtail
+
 ```
 
 **Write Promtail config:**
