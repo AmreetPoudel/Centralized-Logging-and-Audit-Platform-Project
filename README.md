@@ -348,6 +348,8 @@ sudo tail -5 /var/log/auth.log
 **Install Promtail:**
 ```bash
 cd /tmp
+sudo useradd --system --no-create-home --shell /bin/false -G adm promtail
+
 PROMTAIL_VERSION="2.9.8"
 
 wget https://github.com/grafana/loki/releases/download/v${PROMTAIL_VERSION}/promtail-linux-amd64.zip
@@ -430,6 +432,8 @@ Description=Promtail Log Shipping Agent
 After=network.target
 
 [Service]
+User=promtail
+Group=promtail
 ExecStart=/usr/local/bin/promtail -config.file=/etc/promtail/promtail.yaml
 Restart=on-failure
 RestartSec=5s
