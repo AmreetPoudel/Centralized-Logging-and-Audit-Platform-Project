@@ -434,12 +434,16 @@ Description=Promtail Log Shipping Agent
 After=network.target
 
 [Service]
-User=promtail
-Group=promtail
 ExecStart=/usr/local/bin/promtail -config.file=/etc/promtail/promtail.yaml
 Restart=on-failure
 RestartSec=5s
 LimitNOFILE=65536
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/var/lib/promtail
+ReadOnlyPaths=/var/log /etc/promtail
 
 [Install]
 WantedBy=multi-user.target
