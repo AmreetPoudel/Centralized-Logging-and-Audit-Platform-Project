@@ -177,9 +177,7 @@ limits_config:
   max_streams_per_user: 10000
   reject_old_samples: true
   reject_old_samples_max_age: 168h
-
-chunk_store_config:
-  max_look_back_period: 30d
+  max_query_lookback: 30d
 
 table_manager:
   retention_deletes_enabled: true
