@@ -1,105 +1,87 @@
 # Centralized Logging & Audit Platform — Final Build Plan
 
-> **Philosophy:** Do it manually first. Verify it works. Then automate only what needs to scale.
-> Grafana and Loki are installed once on one server — no automation needed.
-> Promtail and auditd go on potentially hundreds of nodes — manual first on one node, then Ansible.
-> No passwordless SSH. No passwordless sudo. No extra system users created just for tooling.
+> **Philosophy:** Manual first. Verify it works. Then automate.
+> Loki and Grafana are one-time manual installs on the logging server.
+> Promtail and Auditd go on hundreds of nodes — manual on one node first, then Ansible.
+> No passwordless SSH. No passwordless sudo. No extra users created just for tooling.
+> Every step has a verification command. Do not proceed until it passes.
 
 ---
 
 ## What Gets Automated vs What Does Not
 
-| Component | How |
+| Component | Method |
 |---|---|
-| Loki | Manual install on logging server — one time |
-| Grafana | Manual install on logging server — one time |
-| Promtail | Manual on first client to verify, then Ansible for all nodes |
-| Auditd | Manual on first client to verify, then Ansible for all nodes |
-| Firewall rules | Not touched — configure separately, do not let this plan break existing rules |
-
----
-
-## Node Layout
-
-| Hostname | IP | Role |
-|---|---|---|
-| `logging-server` | `192.168.1.10` | Loki + Grafana |
-| `client01` | `192.168.1.11` | First node — manual verification |
-| `client02` | `192.168.1.12` | Ansible deployed |
-| `client03` | `192.168.1.13` | Ansible deployed |
-
-Replace these IPs with your actual addresses throughout.
+| Loki | Manual — one time on logging server |
+| Grafana | Manual — one time on logging server |
+| Promtail | Manual on first node to verify, then Ansible |
+| Auditd | Manual on first node to verify, then Ansible |
+| Firewall | Not touched — configure separately |
 
 ---
 
 ## Architecture
 
 ```
-┌──────────────────────────────────────┐
-│  LOGGING SERVER (192.168.1.10)       │
-│  Loki    :3100                       │
-│  Grafana :3000                       │
-└──────────────────────────────────────┘
+┌─────────────────────────────────────┐
+│  LOGGING SERVER                     │
+│  Loki    :3100                      │
+│  Grafana :3000                      │
+└─────────────────────────────────────┘
         ▲            ▲            ▲
    Promtail      Promtail     Promtail
-   client01      client02     client03
+   node01        node02       node03
 ```
 
 ---
 
-## Label Strategy
-
-Define once. Never deviate. Inconsistent labels break every query.
+## Label Strategy — Define Once, Never Deviate
 
 | Label | Values | Set By |
 |---|---|---|
-| `hostname` | `client01`, `client02`, etc. | Ansible inventory var |
+| `hostname` | node hostname | Ansible `inventory_hostname` |
 | `env` | `lab`, `staging`, `prod` | Ansible group var |
-| `service` | `ssh`, `sudo`, `postgresql`, `nginx`, `audit`, `system` | Per scrape job |
-| `log_type` | `auth`, `audit`, `web`, `db`, `system` | Per scrape job |
+| `service` | `ssh`, `sudo`, `audit`, `system`, `nginx`, `postgresql` | Per scrape job |
+| `log_type` | `auth`, `audit`, `system`, `web`, `db` | Per scrape job |
 
-Never make these into labels: IP addresses, usernames, request IDs, URLs. Those are high-cardinality — they go in the log line and are filtered with `|=`.
+Never put IP addresses, usernames, request IDs, or URLs into labels. High-cardinality values go in the log line and are filtered with `|=`.
 
 ---
 
 ## Pre-Start Checklist
 
-- [ ] OS version confirmed — Ubuntu 22.04 LTS on all nodes
-- [ ] Static IPs on all nodes — DHCP will silently break things
+- [ ] Ubuntu 22.04 or 24.04 on all nodes — do not mix
+- [ ] Static IPs on all nodes
 - [ ] `/etc/hosts` or DNS resolving all hostnames
-- [ ] NTP synchronized on all nodes: `timedatectl` shows `NTP synchronized: yes`
-- [ ] Loki version decided: **2.9.8** — v2.x and v3.x have breaking config differences
-- [ ] Separate disk or partition available for Loki data (minimum 20GB)
-- [ ] You can SSH into all nodes with your normal user
+- [ ] NTP synchronized: `timedatectl` shows `NTP synchronized: yes` on every node
+- [ ] Loki version: **2.9.8** — this plan is tested on this version
+- [ ] Separate disk available for Loki data (minimum 20GB)
+- [ ] SSH access with your normal user to all nodes
 - [ ] Your user has sudo access (with password) on all nodes
 
 ---
 
-## Part 1 — Logging Server Setup (Manual Only)
+## Part 1 — Logging Server (Manual Only)
 
-### Step 1 — Prepare the Loki Data Volume
+### Step 1 — Prepare Loki Data Volume
 
 ```bash
-# List block devices to identify the separate disk
 lsblk
+# Identify the separate disk — adjust /dev/sdb below to your actual device
 
-# Format and mount — adjust /dev/sdb to your actual device
 mkfs.ext4 /dev/sdb
 mkdir -p /var/lib/loki
 
-# Get UUID for stable mounting
 blkid /dev/sdb
 # Copy the UUID from output
 
-# Add to fstab
 echo "UUID=your-uuid-here  /var/lib/loki  ext4  defaults  0  2" >> /etc/fstab
 mount -a
 
-# Verify — must show a separate filesystem, not root
 df -h /var/lib/loki
+# Must show /dev/sdb mounted here — not the root filesystem
+# If it shows root filesystem, stop and fix before continuing
 ```
-
-If `df -h /var/lib/loki` shows the root filesystem, Loki data will eventually fill your OS disk and crash everything. Fix this before continuing.
 
 ---
 
@@ -112,11 +94,11 @@ LOKI_VERSION="2.9.8"
 wget https://github.com/grafana/loki/releases/download/v${LOKI_VERSION}/loki-linux-amd64.zip
 unzip loki-linux-amd64.zip
 
-# Verify binary before installing
 ./loki-linux-amd64 --version
+# Verify version matches before installing
 
-mv loki-linux-amd64 /usr/local/bin/loki
-chmod +x /usr/local/bin/loki
+sudo mv loki-linux-amd64 /usr/local/bin/loki
+sudo chmod +x /usr/local/bin/loki
 loki --version
 ```
 
@@ -185,17 +167,17 @@ table_manager:
 EOF
 ```
 
-Verify config is valid before creating the service:
+Verify config before creating the service:
 ```bash
 loki -config.file=/etc/loki/loki.yaml -verify-config
-# Must return: config is valid
+# Warnings about deprecated flags are acceptable — errors are not
 ```
 
-> `from: 2024-01-01` must be a past date. A future date causes Loki to silently reject all writes with no useful error.
+> `from: 2024-01-01` must always be a past date. A future date causes Loki to silently reject all writes.
 
 ---
 
-### Step 4 — Loki as a Systemd Service
+### Step 4 — Loki Systemd Service
 
 ```bash
 sudo tee /etc/systemd/system/loki.service > /dev/null << 'EOF'
@@ -218,21 +200,18 @@ sudo systemctl enable loki
 sudo systemctl start loki
 ```
 
-**Verify:**
+Verify:
 ```bash
 sudo systemctl status loki
+sudo journalctl -u loki -n 30 --no-pager
+# No level=error lines
 
-# Must return "ready"
 curl -s http://localhost:3100/ready
+# Must return: ready
+# First run may show "Ingester not ready: waiting for 15s" — wait and retry, this is normal
 
-# Must return valid JSON
 curl -s http://localhost:3100/loki/api/v1/labels
-```
-
-**Check logs for errors:**
-```bash
-sudo journalctl -u loki -n 50 --no-pager
-# Look for: level=error — there should be none at startup
+# Must return: {"status":"success"}
 ```
 
 ---
@@ -250,23 +229,21 @@ echo "deb [signed-by=/usr/share/keyrings/grafana.key] https://apt.grafana.com st
 
 sudo apt-get update
 sudo apt-get install -y grafana
-
-grafana server -v
 ```
 
 ---
 
 ### Step 6 — Configure Grafana
 
-Edit `/etc/grafana/grafana.ini`. Find and change these specific lines — do not replace the whole file:
-
 ```bash
 sudo nano /etc/grafana/grafana.ini
 ```
 
+Find and set — do not replace the whole file:
+
 Under `[security]`:
 ```ini
-admin_password = something_strong_here
+admin_password = your_strong_password_here
 ```
 
 Under `[users]`:
@@ -279,7 +256,7 @@ Under `[auth.anonymous]`:
 enabled = false
 ```
 
-**Provision the Loki datasource:**
+Provision the Loki datasource:
 ```bash
 sudo mkdir -p /etc/grafana/provisioning/datasources
 
@@ -301,55 +278,62 @@ sudo systemctl enable grafana-server
 sudo systemctl start grafana-server
 ```
 
-**Verify:**
+Verify:
 ```bash
 sudo systemctl status grafana-server
-
-# Should return HTTP 200
 curl -s -o /dev/null -w "%{http_code}" http://localhost:3000/login
+# Must return: 200
 ```
 
-Open `http://192.168.1.10:3000` in a browser. Log in with `admin` and your password.
+Open `http://LOGGING_SERVER_IP:3000` — log in with `admin` and your password.
 
-Go to **Connections → Data sources → Loki → Test**. Must show green — connected.
+Go to **Connections → Data sources → Loki → Test** — must show green.
 
-Go to **Explore**, select Loki, run `{job="test"}` — no results is correct. No connection error is what you are verifying.
+Go to **Explore → select Loki → run** `{job="test"}` — no results is correct, no connection error is what you are verifying.
 
 ---
 
-### Logging Server Validation
+### Logging Server Validation Gate
 
 - [ ] `curl http://localhost:3100/ready` returns `ready`
 - [ ] `systemctl status loki` — active, running
-- [ ] `journalctl -u loki -n 50` — no ERROR lines
+- [ ] `journalctl -u loki -n 30` — no `level=error` lines
 - [ ] `df -h /var/lib/loki` — separate volume, not root filesystem
-- [ ] Grafana login works with the new password (not `admin`/`admin`)
-- [ ] Loki datasource shows green in Grafana
+- [ ] Grafana accessible, admin password changed, Loki datasource green
 
 ---
 
-## Part 2 — Promtail Agent (Manual on client01 First, Then Ansible)
+## Part 2 — Promtail: System and Auth Logs (Manual on First Node)
 
-### Step 7 — Manual Promtail Install on client01
+### Step 7 — Install Promtail
 
-SSH into client01 and run everything in this section as your normal user with sudo.
+SSH into the first node and run as your normal user with sudo.
 
-**Verify the log files you want to ship actually exist:**
+**Verify log files exist and are readable:**
 ```bash
-ls -la /var/log/syslog
-ls -la /var/log/auth.log
-# Both must exist and have recent timestamps
-
-# Verify your user can read them (it should via sudo)
+ls -la /var/log/syslog /var/log/auth.log
 sudo tail -5 /var/log/syslog
 sudo tail -5 /var/log/auth.log
+# Both must return content
 ```
 
-**Install Promtail:**
+**Create promtail system user:**
 ```bash
-cd /tmp
 sudo useradd --system --no-create-home --shell /bin/false -G adm promtail
 
+id promtail
+# Must show adm in groups
+
+sudo -u promtail cat /var/log/syslog | head -3
+sudo -u promtail cat /var/log/auth.log | head -3
+# Both must return content — if permission denied, stop and fix group membership
+```
+
+> **Note on Ubuntu 24.04:** Promtail 2.9.8 ignores `User=` in the systemd unit and runs as root regardless. The `promtail` user is still created for future compatibility. The service is hardened with systemd security directives to limit blast radius.
+
+**Install binary:**
+```bash
+cd /tmp
 PROMTAIL_VERSION="2.9.8"
 
 wget https://github.com/grafana/loki/releases/download/v${PROMTAIL_VERSION}/promtail-linux-amd64.zip
@@ -358,18 +342,22 @@ unzip promtail-linux-amd64.zip
 ./promtail-linux-amd64 --version
 
 sudo mv promtail-linux-amd64 /usr/local/bin/promtail
+sudo chown root:root /usr/local/bin/promtail
 sudo chmod +x /usr/local/bin/promtail
-promtail --version
 ```
 
-**Create config directory and positions directory:**
+**Create directories:**
 ```bash
 sudo mkdir -p /etc/promtail /var/lib/promtail
 sudo chown -R promtail:promtail /var/lib/promtail
-
 ```
 
-**Write Promtail config:**
+---
+
+### Step 8 — Configure Promtail for System and Auth Logs Only
+
+At this point auditd is not installed yet. The config only covers system and auth logs.
+
 ```bash
 sudo tee /etc/promtail/promtail.yaml > /dev/null << 'EOF'
 server:
@@ -381,7 +369,7 @@ positions:
   filename: /var/lib/promtail/positions.yaml
 
 clients:
-  - url: http://192.168.1.10:3100/loki/api/v1/push
+  - url: http://LOKI_SERVER_IP:3100/loki/api/v1/push
     backoff_config:
       min_period: 500ms
       max_period: 5m
@@ -394,7 +382,7 @@ scrape_configs:
       - targets: [localhost]
         labels:
           job: system
-          hostname: client01
+          hostname: HOSTNAME
           env: lab
           service: system
           log_type: system
@@ -405,7 +393,7 @@ scrape_configs:
       - targets: [localhost]
         labels:
           job: auth
-          hostname: client01
+          hostname: HOSTNAME
           env: lab
           service: ssh
           log_type: auth
@@ -413,20 +401,18 @@ scrape_configs:
 EOF
 ```
 
-**Verify config syntax:**
+Replace `LOKI_SERVER_IP` and `HOSTNAME` with actual values.
+
+**Verify config and connectivity:**
 ```bash
 promtail -config.file=/etc/promtail/promtail.yaml -dry-run
 # Must exit with no errors
+
+curl -s http://LOKI_SERVER_IP:3100/ready
+# Must return: ready — if not, fix connectivity before starting the service
 ```
 
-**Verify connectivity to Loki before starting the service:**
-```bash
-curl -s http://192.168.1.10:3100/ready
-# Must return: ready
-# If this fails, fix connectivity before continuing — the service will just silently fail
-```
-
-**Create and start the service:**
+**Create systemd service:**
 ```bash
 sudo tee /etc/systemd/system/promtail.service > /dev/null << 'EOF'
 [Unit]
@@ -454,186 +440,294 @@ sudo systemctl enable promtail
 sudo systemctl start promtail
 ```
 
-**Verify Promtail is running and shipping:**
+**Verify:**
 ```bash
 sudo systemctl status promtail
+sudo journalctl -u promtail -n 30 --no-pager
+# No connection refused, no permission denied
 
-# Watch for errors — specifically "connection refused" or "permission denied"
-sudo journalctl -u promtail -n 50 --no-pager
-
-# Positions file must exist and have entries — confirms Promtail is reading files
 sudo cat /var/lib/promtail/positions.yaml
-# Must show entries for /var/log/syslog and /var/log/auth.log with non-zero offsets
+# Must show entries for syslog and auth.log with non-zero offsets
 
-# Promtail metrics endpoint — if this returns data, it is alive
 curl -s http://localhost:9080/metrics | grep promtail_sent_bytes_total
+# Must return the metric line
 ```
-
-**Verify in Grafana Explore:**
-```logql
-{hostname="client01"}
-```
-
-Results must appear within 30 seconds. If nothing after 60 seconds:
-1. `sudo journalctl -u promtail -f` — look for push errors
-2. `sudo journalctl -u loki -f` on logging server — look for rejection errors
-3. Re-run `curl -s http://192.168.1.10:3100/ready` from client01
 
 ---
 
-### Step 8 — Generate Test Events and Verify Capture
+### Step 9 — Verify System and Auth Logs in Grafana
 
-Do this on client01 before writing any Ansible automation. If these do not appear in Grafana, something is wrong and automating it will deploy broken agents everywhere.
+Generate events and confirm each appears in Grafana before moving on.
 
 ```bash
-# Generate a sudo event
 sudo ls /root
-
-# Generate a failed SSH — run this from your workstation
-ssh nonexistent@192.168.1.11
-
-# Check the file directly first
-grep "COMMAND\|Failed password\|Accepted" /var/log/auth.log | tail -10
+ssh nonexistent@localhost 2>/dev/null || true
+grep "COMMAND\|Failed password" /var/log/auth.log | tail -5
 ```
 
-Then in Grafana Explore:
+Grafana Explore:
 ```logql
-{log_type="auth", hostname="client01"} |= "COMMAND"
+{log_type="system", hostname="your-hostname"}
+{log_type="auth"} |= "COMMAND"
 {log_type="auth"} |= "Failed password"
 ```
 
-Both must return results within 60 seconds. Only proceed to Ansible after this passes.
+All must return results within 60 seconds. Only then move to auditd.
 
 ---
 
-### Step 9 — Ansible Automation for Promtail (100s of Nodes)
+## Part 3 — Auditd (Manual on First Node)
 
-Now that you know the manual steps work, encode them exactly into Ansible. Nothing in these roles should be a surprise — it is the same commands you just ran.
+### Step 10 — Install Auditd
 
-**Ansible inventory structure:**
+```bash
+sudo apt-get install -y auditd audispd-plugins
+
+sudo systemctl enable auditd
+sudo systemctl start auditd
+sudo systemctl status auditd
+
+ls -la /var/log/audit/audit.log
+sudo tail -5 /var/log/audit/audit.log
+# Must show recent events
+```
+
+---
+
+### Step 11 — Write Audit Rules
+
+```bash
+sudo tee /etc/audit/rules.d/logging-platform.rules > /dev/null << 'EOF'
+## Clear existing rules
+-D
+
+## Buffer size — prevents dropped events under load
+-b 8192
+
+## Backlog wait time
+--backlog_wait_time 60000
+
+## Failure mode: 1 = silent, 2 = panic. Use 1 in production.
+-f 1
+
+## User and group file changes
+-w /etc/passwd -p wa -k user_modification
+-w /etc/shadow -p wa -k user_modification
+-w /etc/group -p wa -k group_modification
+-w /etc/gshadow -p wa -k group_modification
+-w /etc/sudoers -p wa -k sudoers_modification
+-w /etc/sudoers.d/ -p wa -k sudoers_modification
+
+## User management commands
+-w /usr/sbin/useradd -p x -k user_mgmt
+-w /usr/sbin/userdel -p x -k user_mgmt
+-w /usr/sbin/usermod -p x -k user_mgmt
+-w /usr/sbin/groupadd -p x -k user_mgmt
+-w /usr/sbin/groupdel -p x -k user_mgmt
+-w /usr/sbin/passwd -p x -k user_mgmt
+
+## SSH config changes
+-w /etc/ssh/sshd_config -p wa -k ssh_config
+
+## Systemd service changes
+-w /etc/systemd/system/ -p wa -k service_modification
+
+## Cron changes
+-w /etc/cron.d/ -p wa -k cron_modification
+-w /var/spool/cron/ -p wa -k cron_modification
+
+## Privileged command execution
+-a always,exit -F path=/usr/bin/sudo -F perm=x -F auid>=1000 -F auid!=-1 -k priv_cmd
+-a always,exit -F path=/usr/bin/su -F perm=x -F auid>=1000 -F auid!=-1 -k priv_cmd
+
+## DO NOT enable immutable mode until rules are finalised
+## -e 2
+EOF
+```
+
+Load and verify:
+```bash
+sudo augenrules --load
+sudo auditctl -l
+# Must list every rule above
+```
+
+---
+
+### Step 12 — Test Every Rule Category
+
+Run each command and verify the event appears in `/var/log/audit/audit.log` first.
+
+```bash
+# user_modification
+sudo useradd auditverify
+sudo userdel auditverify
+sudo grep "user_modification" /var/log/audit/audit.log | tail -3
+
+# user_mgmt
+sudo useradd auditverify2
+sudo userdel auditverify2
+sudo grep "user_mgmt" /var/log/audit/audit.log | tail -3
+
+# sudoers_modification
+sudo touch /etc/sudoers.d/auditverify
+sudo rm /etc/sudoers.d/auditverify
+sudo grep "sudoers_modification" /var/log/audit/audit.log | tail -3
+
+# ssh_config
+sudo touch /etc/ssh/sshd_config
+sudo grep "ssh_config" /var/log/audit/audit.log | tail -3
+
+# priv_cmd
+sudo ls /root
+sudo grep "priv_cmd" /var/log/audit/audit.log | tail -3
+```
+
+Each `grep` must return events. If any returns nothing, the rule is not working — check `auditctl -l` to confirm it loaded.
+
+---
+
+### Auditd Validation Gate
+
+- [ ] `auditctl -l` shows all rules loaded
+- [ ] `sudo useradd` generates event with key `user_mgmt` in audit.log
+- [ ] `sudo touch /etc/sudoers.d/test` generates `sudoers_modification` event
+- [ ] `sudo ls /root` generates `priv_cmd` event
+- [ ] All events visible in `/var/log/audit/audit.log` before proceeding
+
+---
+
+## Part 4 — Add Audit Logs to Promtail
+
+Auditd is working and verified. Now add the audit scrape job to the existing Promtail config.
+
+### Step 13 — Add Audit Scrape Job
+
+```bash
+sudo tee -a /etc/promtail/promtail.yaml > /dev/null << 'EOF'
+
+  - job_name: audit
+    static_configs:
+      - targets: [localhost]
+        labels:
+          job: audit
+          hostname: HOSTNAME
+          env: lab
+          service: audit
+          log_type: audit
+          __path__: /var/log/audit/audit.log
+    pipeline_stages:
+      - regex:
+          expression: '.*key="(?P<audit_key>[^"]+)"'
+      - labels:
+          audit_key:
+EOF
+```
+
+Replace `HOSTNAME` with the actual hostname.
+
+```bash
+sudo systemctl restart promtail
+sudo systemctl status promtail
+sudo journalctl -u promtail -n 20 --no-pager
+```
+
+---
+
+### Step 14 — Verify Audit Events in Grafana
+
+Generate events and confirm they appear:
+
+```bash
+sudo useradd finalverify
+sudo userdel finalverify
+sudo touch /etc/sudoers.d/ztest && sudo rm /etc/sudoers.d/ztest
+```
+
+Grafana Explore:
+```logql
+{log_type="audit"}
+{log_type="audit", audit_key="user_mgmt"}
+{log_type="audit", audit_key="sudoers_modification"}
+{log_type="audit", audit_key="priv_cmd"}
+```
+
+All must return results within 60 seconds. Only proceed to Ansible after all pass.
+
+---
+
+## Part 5 — Ansible Automation
+
+Everything above is verified manually. Now encode it into Ansible. No roles — flat playbooks with separate Jinja2 templates per service.
+
 ```
 ansible/
-├── inventory/
-│   └── hosts.ini
+├── inventory.ini
 ├── group_vars/
 │   └── all/
 │       ├── vars.yml
-│       └── vault.yml        ← encrypted with ansible-vault
-├── roles/
-│   └── logging-agent/
-│       ├── tasks/main.yml
-│       ├── handlers/main.yml
-│       └── templates/
-│           ├── promtail.yaml.j2
-│           └── promtail.service.j2
-└── deploy-agents.yml
+│       └── vault.yml          ← encrypted
+├── templates/
+│   ├── promtail.yaml.j2
+│   ├── promtail.service.j2
+│   └── audit.rules.j2
+├── install_promtail.yml
+├── install_auditd.yml
+└── site.yml
 ```
 
-**`inventory/hosts.ini`:**
-```ini
-[clients]
-client01 ansible_host=192.168.1.11
-client02 ansible_host=192.168.1.12
-client03 ansible_host=192.168.1.13
+---
 
-[clients:vars]
-loki_url=192.168.1.10:3100
+### inventory.ini
+
+```ini
+[nodes]
+node01 ansible_host=192.168.1.11
+node02 ansible_host=192.168.1.12
+node03 ansible_host=192.168.1.13
+
+[nodes:vars]
+loki_url=LOKI_SERVER_IP:3100
 env=lab
 ```
 
-**`group_vars/all/vars.yml`:**
+---
+
+### group_vars/all/vars.yml
+
 ```yaml
 promtail_version: "2.9.8"
-ansible_user: your_normal_username
+ansible_user: your_username
 ansible_become: true
+ansible_ssh_pass: "{{ vault_ssh_pass }}"
+ansible_become_pass: "{{ vault_become_pass }}"
 ```
 
-**`group_vars/all/vault.yml` — create then encrypt:**
+---
+
+### group_vars/all/vault.yml
+
+Create then encrypt:
 ```yaml
-vault_ssh_pass: "your_ssh_password"
-vault_become_pass: "your_sudo_password"
+vault_ssh_pass: "ssh_password_here"
+vault_become_pass: "sudo_password_here"
 ```
 
 ```bash
 ansible-vault encrypt group_vars/all/vault.yml
 ```
 
-**Reference vault vars in `vars.yml`:**
-```yaml
-ansible_ssh_pass: "{{ vault_ssh_pass }}"
-ansible_become_pass: "{{ vault_become_pass }}"
+If passwords differ per host, use `host_vars/` instead:
+```bash
+mkdir -p host_vars
+# Create host_vars/node01.yml with that node's passwords
+ansible-vault encrypt host_vars/node01.yml
 ```
 
-**`roles/logging-agent/tasks/main.yml`:**
-```yaml
 ---
-- name: Create promtail config and positions directories
-  file:
-    path: "{{ item }}"
-    state: directory
-    mode: '0755'
-  loop:
-    - /etc/promtail
-    - /var/lib/promtail
 
-- name: Download promtail archive
-  get_url:
-    url: "https://github.com/grafana/loki/releases/download/v{{ promtail_version }}/promtail-linux-amd64.zip"
-    dest: /tmp/promtail-{{ promtail_version }}.zip
-    mode: '0644'
+### templates/promtail.yaml.j2
 
-- name: Unarchive promtail
-  unarchive:
-    src: /tmp/promtail-{{ promtail_version }}.zip
-    dest: /tmp/
-    remote_src: yes
-
-- name: Install promtail binary
-  copy:
-    src: /tmp/promtail-linux-amd64
-    dest: /usr/local/bin/promtail
-    mode: '0755'
-    remote_src: yes
-  notify: restart promtail
-
-- name: Deploy promtail config
-  template:
-    src: promtail.yaml.j2
-    dest: /etc/promtail/promtail.yaml
-    mode: '0640'
-  notify: restart promtail
-
-- name: Deploy promtail systemd unit
-  template:
-    src: promtail.service.j2
-    dest: /etc/systemd/system/promtail.service
-    mode: '0644'
-  notify:
-    - reload systemd
-    - restart promtail
-
-- name: Enable and start promtail
-  systemd:
-    name: promtail
-    enabled: yes
-    state: started
-    daemon_reload: yes
-```
-
-**`roles/logging-agent/handlers/main.yml`:**
-```yaml
----
-- name: reload systemd
-  systemd:
-    daemon_reload: yes
-
-- name: restart promtail
-  systemd:
-    name: promtail
-    state: restarted
-```
-
-**`roles/logging-agent/templates/promtail.yaml.j2`:**
 ```yaml
 server:
   http_listen_port: 9080
@@ -673,289 +767,7 @@ scrape_configs:
           service: ssh
           log_type: auth
           __path__: /var/log/auth.log
-```
 
-**`roles/logging-agent/templates/promtail.service.j2`:**
-```ini
-[Unit]
-Description=Promtail Log Shipping Agent
-After=network.target
-
-[Service]
-ExecStart=/usr/local/bin/promtail -config.file=/etc/promtail/promtail.yaml
-Restart=on-failure
-RestartSec=5s
-LimitNOFILE=65536
-
-[Install]
-WantedBy=multi-user.target
-```
-
-**`deploy-agents.yml`:**
-```yaml
----
-- name: Deploy Promtail to all clients
-  hosts: clients
-  become: yes
-  roles:
-    - logging-agent
-```
-
-**Run:**
-```bash
-ansible-playbook -i inventory/hosts.ini deploy-agents.yml --ask-vault-pass
-```
-
-**Idempotency test — must pass before you deploy to 100s of nodes:**
-```bash
-# First run — expect changes
-ansible-playbook -i inventory/hosts.ini deploy-agents.yml --ask-vault-pass
-
-# Second run immediately after — must show changed=0
-ansible-playbook -i inventory/hosts.ini deploy-agents.yml --ask-vault-pass
-# Every host: ok=N  changed=0  failed=0
-```
-
-**Adding a new node:**
-```bash
-# 1. Add to inventory/hosts.ini under [clients]
-# 2. Run targeting only the new host
-ansible-playbook -i inventory/hosts.ini deploy-agents.yml --ask-vault-pass -l new-hostname
-
-# 3. Verify in Grafana — {hostname="new-hostname"} should return logs within 5 minutes
-```
-
----
-
-## Part 3 — Auditd (Manual on client01 First, Then Ansible)
-
-### Step 10 — Manual Auditd Setup on client01
-
-**Install auditd:**
-```bash
-sudo apt-get install -y auditd audispd-plugins
-
-sudo systemctl enable auditd
-sudo systemctl start auditd
-sudo systemctl status auditd
-
-# Verify audit log exists
-ls -la /var/log/audit/audit.log
-```
-
-**Write audit rules:**
-```bash
-sudo tee /etc/audit/rules.d/logging-platform.rules > /dev/null << 'EOF'
-# Clear existing rules
--D
-
-# Buffer size — prevents dropped events under load
--b 8192
-
-# Failure mode: 1 = silent, 2 = panic. Use 1 in production.
--f 1
-
-# User and group file changes
--w /etc/passwd -p wa -k user_modification
--w /etc/shadow -p wa -k user_modification
--w /etc/group -p wa -k group_modification
--w /etc/gshadow -p wa -k group_modification
--w /etc/sudoers -p wa -k sudoers_modification
--w /etc/sudoers.d/ -p wa -k sudoers_modification
-
-# User management command execution
--w /usr/sbin/useradd -p x -k user_mgmt
--w /usr/sbin/userdel -p x -k user_mgmt
--w /usr/sbin/usermod -p x -k user_mgmt
--w /usr/sbin/groupadd -p x -k user_mgmt
--w /usr/sbin/groupdel -p x -k user_mgmt
--w /usr/sbin/passwd -p x -k user_mgmt
-
-# SSH config changes
--w /etc/ssh/sshd_config -p wa -k ssh_config
-
-# Systemd service changes
--w /etc/systemd/system/ -p wa -k service_modification
-
-# Cron changes
--w /etc/cron.d/ -p wa -k cron_modification
--w /var/spool/cron/ -p wa -k cron_modification
-
-# Privileged command execution
--a always,exit -F path=/usr/bin/sudo -F perm=x -F auid>=1000 -F auid!=-1 -k priv_cmd
--a always,exit -F path=/usr/bin/su -F perm=x -F auid>=1000 -F auid!=-1 -k priv_cmd
-
-# DO NOT add -e 2 (immutable) until rules are finalized
-# -e 2 requires a reboot to change any rules
-EOF
-```
-
-**Load the rules:**
-```bash
-sudo augenrules --load
-
-# Verify rules are active
-sudo auditctl -l
-# Must list all the rules you just wrote
-```
-
-**Generate a test event and verify it appears in audit.log:**
-```bash
-sudo useradd auditverify
-sudo userdel auditverify
-
-sudo grep "user_modification\|user_mgmt" /var/log/audit/audit.log | tail -10
-# Must show the useradd/userdel events
-```
-
-**Enable syslog forwarding so Promtail can pick up audit events:**
-```bash
-# Check current state
-cat /etc/audit/plugins.d/syslog.conf
-
-sudo sed -i 's/^active = no/active = yes/' /etc/audit/plugins.d/syslog.conf
-
-sudo systemctl restart auditd
-
-# Verify audit events now appear in syslog
-sudo grep "type=USER_MGMT\|type=ADD_USER" /var/log/syslog | tail -5
-```
-
-**Generate another event and verify it reaches syslog:**
-```bash
-sudo useradd auditverify2
-sudo userdel auditverify2
-sudo grep "auditverify2" /var/log/syslog | tail -5
-# Must show the event — syslog forwarding is working
-```
-
-**Add audit scrape job to Promtail on client01:**
-```bash
-sudo tee -a /etc/promtail/promtail.yaml > /dev/null << 'EOF'
-
-  - job_name: audit
-    static_configs:
-      - targets: [localhost]
-        labels:
-          job: audit
-          hostname: client01
-          env: lab
-          service: audit
-          log_type: audit
-          __path__: /var/log/audit/audit.log
-    pipeline_stages:
-      - match:
-          selector: '{log_type="audit"}'
-          stages:
-            - regex:
-                expression: '.*key="(?P<audit_key>[^"]+)"'
-            - labels:
-                audit_key:
-EOF
-
-sudo systemctl restart promtail
-```
-
-**Verify audit events appear in Grafana:**
-```logql
-{log_type="audit", hostname="client01"}
-{log_type="audit"} |= "user_modification"
-```
-
-Must return results within 60 seconds after generating a test event (`sudo useradd test && sudo userdel test`).
-
----
-
-### Step 11 — Ansible Automation for Auditd
-
-Add an `auditd` role to the existing Ansible structure.
-
-**`roles/auditd/tasks/main.yml`:**
-```yaml
----
-- name: Install auditd and plugins
-  apt:
-    name:
-      - auditd
-      - audispd-plugins
-    state: present
-    update_cache: yes
-
-- name: Deploy audit rules
-  template:
-    src: audit.rules.j2
-    dest: /etc/audit/rules.d/logging-platform.rules
-    mode: '0640'
-  notify: reload auditd rules
-
-- name: Enable syslog forwarding for audit events
-  lineinfile:
-    path: /etc/audit/plugins.d/syslog.conf
-    regexp: '^active'
-    line: 'active = yes'
-  notify: restart auditd
-
-- name: Enable and start auditd
-  systemd:
-    name: auditd
-    enabled: yes
-    state: started
-```
-
-**`roles/auditd/handlers/main.yml`:**
-```yaml
----
-- name: reload auditd rules
-  command: augenrules --load
-
-- name: restart auditd
-  systemd:
-    name: auditd
-    state: restarted
-```
-
-**`roles/auditd/templates/audit.rules.j2`:**
-```bash
--D
--b 8192
--f 1
-
--w /etc/passwd -p wa -k user_modification
--w /etc/shadow -p wa -k user_modification
--w /etc/group -p wa -k group_modification
--w /etc/gshadow -p wa -k group_modification
--w /etc/sudoers -p wa -k sudoers_modification
--w /etc/sudoers.d/ -p wa -k sudoers_modification
-
--w /usr/sbin/useradd -p x -k user_mgmt
--w /usr/sbin/userdel -p x -k user_mgmt
--w /usr/sbin/usermod -p x -k user_mgmt
--w /usr/sbin/groupadd -p x -k user_mgmt
--w /usr/sbin/groupdel -p x -k user_mgmt
--w /usr/sbin/passwd -p x -k user_mgmt
-
--w /etc/ssh/sshd_config -p wa -k ssh_config
--w /etc/systemd/system/ -p wa -k service_modification
--w /etc/cron.d/ -p wa -k cron_modification
--w /var/spool/cron/ -p wa -k cron_modification
-
--a always,exit -F path=/usr/bin/sudo -F perm=x -F auid>=1000 -F auid!=-1 -k priv_cmd
--a always,exit -F path=/usr/bin/su -F perm=x -F auid>=1000 -F auid!=-1 -k priv_cmd
-```
-
-**Update `deploy-agents.yml` to include auditd:**
-```yaml
----
-- name: Deploy agents to all clients
-  hosts: clients
-  become: yes
-  roles:
-    - auditd
-    - logging-agent
-```
-
-**Update `promtail.yaml.j2` to include the audit scrape job:**
-```yaml
   - job_name: audit
     static_configs:
       - targets: [localhost]
@@ -967,291 +779,354 @@ Add an `auditd` role to the existing Ansible structure.
           log_type: audit
           __path__: /var/log/audit/audit.log
     pipeline_stages:
-      - match:
-          selector: '{log_type="audit"}'
-          stages:
-            - regex:
-                expression: '.*key="(?P<audit_key>[^"]+)"'
-            - labels:
-                audit_key:
-```
-
-**Run and test idempotency:**
-```bash
-ansible-playbook -i inventory/hosts.ini deploy-agents.yml --ask-vault-pass
-
-# Second run must show changed=0
-ansible-playbook -i inventory/hosts.ini deploy-agents.yml --ask-vault-pass
-```
-
----
-
-## Part 4 — Application Logs (Manual — Add to Ansible After Verification)
-
-### Step 12 — PostgreSQL Logs (on the node running PostgreSQL)
-
-**Enable logging in PostgreSQL:**
-```bash
-# Find the config file location
-sudo -u postgres psql -c "SHOW config_file;"
-
-sudo nano /etc/postgresql/*/main/postgresql.conf
-```
-
-Set these values:
-```
-log_destination = 'stderr'
-logging_collector = on
-log_directory = '/var/log/postgresql'
-log_filename = 'postgresql-%Y-%m-%d.log'
-log_rotation_age = 1d
-log_min_duration_statement = 1000
-log_line_prefix = '%t [%p]: [%l-1] user=%u,db=%d,app=%a,client=%h '
-log_connections = on
-log_disconnections = on
-log_lock_waits = on
-```
-
-```bash
-sudo systemctl reload postgresql
-
-# Verify log directory and file exist
-ls -la /var/log/postgresql/
-sudo tail -10 /var/log/postgresql/postgresql-$(date +%Y-%m-%d).log
-```
-
-**Verify Promtail can read PostgreSQL logs:**
-```bash
-# Check permissions
-ls -la /var/log/postgresql/
-
-# Test read access with your user (Promtail runs as your service user)
-sudo tail -5 /var/log/postgresql/postgresql-$(date +%Y-%m-%d).log
-
-# If permission denied — fix permissions
-sudo chmod 755 /var/log/postgresql
-```
-
-**Add to Promtail config:**
-```yaml
-  - job_name: postgresql
-    static_configs:
-      - targets: [localhost]
-        labels:
-          job: postgresql
-          hostname: client01
-          env: lab
-          service: postgresql
-          log_type: db
-          __path__: /var/log/postgresql/postgresql-*.log
-```
-
-**Generate a test event and verify:**
-```bash
-# Auth failure
-psql -U nonexistent -d postgres 2>/dev/null || true
-
-# Slow query (triggers log_min_duration_statement = 1000ms)
-sudo -u postgres psql -c "SELECT pg_sleep(1.5);"
-```
-
-In Grafana:
-```logql
-{service="postgresql"} |= "authentication failed"
-{service="postgresql"} |= "duration"
-```
-
----
-
-### Step 13 — Nginx Logs (on the node running Nginx)
-
-**Configure JSON log format:**
-```bash
-sudo nano /etc/nginx/nginx.conf
-```
-
-Add inside the `http {}` block:
-```nginx
-log_format json_combined escape=json '{'
-  '"time":"$time_iso8601",'
-  '"remote_addr":"$remote_addr",'
-  '"status":$status,'
-  '"request":"$request",'
-  '"body_bytes_sent":$body_bytes_sent,'
-  '"request_time":$request_time'
-'}';
-
-access_log /var/log/nginx/access.log json_combined flush=1s;
-error_log /var/log/nginx/error.log warn;
-```
-
-```bash
-sudo nginx -t
-# Must return: syntax is ok
-
-sudo nginx -s reload
-
-# Verify JSON format
-curl -s http://localhost/ > /dev/null
-sudo tail -3 /var/log/nginx/access.log
-# Must be a valid JSON line
-```
-
-**Add to Promtail config:**
-```yaml
-  - job_name: nginx-access
-    static_configs:
-      - targets: [localhost]
-        labels:
-          job: nginx
-          hostname: client02
-          env: lab
-          service: nginx
-          log_type: web
-          __path__: /var/log/nginx/access.log
-    pipeline_stages:
-      - json:
-          expressions:
-            status: status
+      - regex:
+          expression: '.*key="(?P<audit_key>[^"]+)"'
       - labels:
-          status:
-
-  - job_name: nginx-error
-    static_configs:
-      - targets: [localhost]
-        labels:
-          job: nginx-error
-          hostname: client02
-          env: lab
-          service: nginx
-          log_type: web
-          __path__: /var/log/nginx/error.log
+          audit_key:
 ```
 
-**Verify:**
-```bash
-curl -s http://localhost/doesnotexist > /dev/null   # 404
-```
+The audit scrape job is included here because by the time Ansible runs, auditd is already installed and verified — `site.yml` runs `install_auditd.yml` before `install_promtail.yml`.
 
-```logql
-{service="nginx"} | json | status >= 400
+---
+
+### templates/promtail.service.j2
+
+```ini
+[Unit]
+Description=Promtail Log Shipping Agent
+After=network.target
+
+[Service]
+ExecStart=/usr/local/bin/promtail -config.file=/etc/promtail/promtail.yaml
+Restart=on-failure
+RestartSec=5s
+LimitNOFILE=65536
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/var/lib/promtail
+ReadOnlyPaths=/var/log /etc/promtail
+
+[Install]
+WantedBy=multi-user.target
 ```
 
 ---
 
-## Part 5 — Dashboards
+### templates/audit.rules.j2
 
-Build in Grafana UI. Test every query in Explore before adding it to a panel.
-
-**Set up provisioning so dashboards survive reinstalls:**
 ```bash
-sudo mkdir -p /var/lib/grafana/dashboards
-sudo chown grafana:grafana /var/lib/grafana/dashboards
+## Clear existing rules
+-D
 
-sudo tee /etc/grafana/provisioning/dashboards/default.yaml > /dev/null << 'EOF'
-apiVersion: 1
-providers:
-  - name: default
-    folder: Logging Platform
-    type: file
-    options:
-      path: /var/lib/grafana/dashboards
-      updateIntervalSeconds: 30
-EOF
+## Buffer size
+-b 8192
 
-sudo systemctl restart grafana-server
+## Backlog wait time
+--backlog_wait_time 60000
+
+## Failure mode: 1 = silent
+-f 1
+
+## User and group file changes
+-w /etc/passwd -p wa -k user_modification
+-w /etc/shadow -p wa -k user_modification
+-w /etc/group -p wa -k group_modification
+-w /etc/gshadow -p wa -k group_modification
+-w /etc/sudoers -p wa -k sudoers_modification
+-w /etc/sudoers.d/ -p wa -k sudoers_modification
+
+## User management commands
+-w /usr/sbin/useradd -p x -k user_mgmt
+-w /usr/sbin/userdel -p x -k user_mgmt
+-w /usr/sbin/usermod -p x -k user_mgmt
+-w /usr/sbin/groupadd -p x -k user_mgmt
+-w /usr/sbin/groupdel -p x -k user_mgmt
+-w /usr/sbin/passwd -p x -k user_mgmt
+
+## SSH config changes
+-w /etc/ssh/sshd_config -p wa -k ssh_config
+
+## Systemd service changes
+-w /etc/systemd/system/ -p wa -k service_modification
+
+## Cron changes
+-w /etc/cron.d/ -p wa -k cron_modification
+-w /var/spool/cron/ -p wa -k cron_modification
+
+## Privileged command execution
+-a always,exit -F path=/usr/bin/sudo -F perm=x -F auid>=1000 -F auid!=-1 -k priv_cmd
+-a always,exit -F path=/usr/bin/su -F perm=x -F auid>=1000 -F auid!=-1 -k priv_cmd
 ```
-
-After building each dashboard in the UI: **Share → Export → Save to file** → copy to `/var/lib/grafana/dashboards/`.
-
-**Dashboard panel queries — verify each in Explore before using:**
-
-```logql
-# Auth Dashboard
-{log_type="auth"} |= "Failed password"
-{log_type="auth"} |= "COMMAND"
-count_over_time({log_type="auth"} |= "Failed password" [24h])
-sum(rate({log_type="auth"} |= "Failed password" [$__interval]))
-
-# Audit Dashboard
-{log_type="audit"} |= "user_modification"
-{log_type="audit"} |= "sudoers_modification"
-{log_type="audit", audit_key="user_mgmt"}
-
-# PostgreSQL Dashboard
-{service="postgresql"} |= "ERROR"
-{service="postgresql"} |= "authentication failed"
-{service="postgresql"} |= "duration"
-
-# Nginx Dashboard
-{service="nginx"} | json | status >= 400
-{service="nginx"} | json | status >= 500
-count_over_time({service="nginx"} [$__interval])
-```
-
-**Add these template variables to every dashboard:**
-
-| Variable | Query |
-|---|---|
-| `hostname` | `label_values(hostname)` |
-| `env` | `label_values(env)` |
-| `service` | `label_values(service)` |
-
-Use `$hostname` in all queries so dashboards are filterable per node.
 
 ---
 
-## Final Validation
+### install_auditd.yml
 
-Generate every event type. Verify each one in Grafana before marking done.
+```yaml
+---
+- name: Install and configure Auditd
+  hosts: nodes
+  become: yes
 
-| Event | Command | Grafana Query | Pass? |
+  tasks:
+    - name: Install auditd and plugins
+      apt:
+        name:
+          - auditd
+          - audispd-plugins
+        state: present
+        update_cache: yes
+
+    - name: Deploy audit rules
+      template:
+        src: templates/audit.rules.j2
+        dest: /etc/audit/rules.d/logging-platform.rules
+        mode: '0640'
+      notify: reload audit rules
+
+    - name: Enable and start auditd
+      systemd:
+        name: auditd
+        enabled: yes
+        state: started
+
+    - name: Verify audit rules loaded
+      command: auditctl -l
+      register: audit_rules
+      changed_when: false
+
+    - name: Fail if no rules loaded
+      fail:
+        msg: "Audit rules not loaded on {{ inventory_hostname }}"
+      when: audit_rules.stdout_lines | length < 5
+
+    - name: Print audit rules count per host
+      debug:
+        msg: "{{ inventory_hostname }} — {{ audit_rules.stdout_lines | length }} audit rules loaded"
+
+  handlers:
+    - name: reload audit rules
+      command: augenrules --load
+```
+
+---
+
+### install_promtail.yml
+
+```yaml
+---
+- name: Install and configure Promtail
+  hosts: nodes
+  become: yes
+
+  tasks:
+    - name: Check Loki is reachable before proceeding
+      uri:
+        url: "http://{{ loki_url }}/ready"
+        return_content: yes
+      register: loki_check
+      failed_when: "'ready' not in loki_check.content"
+      delegate_to: localhost
+      become: no
+
+    - name: Create promtail system user in adm group
+      user:
+        name: promtail
+        system: yes
+        shell: /bin/false
+        create_home: no
+        groups: adm
+        append: yes
+
+    - name: Create promtail directories
+      file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+      loop:
+        - /etc/promtail
+        - /var/lib/promtail
+
+    - name: Set ownership on positions directory
+      file:
+        path: /var/lib/promtail
+        owner: promtail
+        group: promtail
+        recurse: yes
+
+    - name: Download promtail archive
+      get_url:
+        url: "https://github.com/grafana/loki/releases/download/v{{ promtail_version }}/promtail-linux-amd64.zip"
+        dest: /tmp/promtail-{{ promtail_version }}.zip
+        mode: '0644'
+
+    - name: Unarchive promtail
+      unarchive:
+        src: /tmp/promtail-{{ promtail_version }}.zip
+        dest: /tmp/
+        remote_src: yes
+
+    - name: Install promtail binary
+      copy:
+        src: /tmp/promtail-linux-amd64
+        dest: /usr/local/bin/promtail
+        owner: root
+        group: root
+        mode: '0755'
+        remote_src: yes
+      notify: restart promtail
+
+    - name: Deploy promtail config
+      template:
+        src: templates/promtail.yaml.j2
+        dest: /etc/promtail/promtail.yaml
+        mode: '0640'
+      notify: restart promtail
+
+    - name: Deploy promtail systemd unit
+      template:
+        src: templates/promtail.service.j2
+        dest: /etc/systemd/system/promtail.service
+        mode: '0644'
+      notify:
+        - reload systemd
+        - restart promtail
+
+    - name: Enable and start promtail
+      systemd:
+        name: promtail
+        enabled: yes
+        state: started
+        daemon_reload: yes
+
+    - name: Wait for promtail to start
+      pause:
+        seconds: 10
+
+    - name: Verify promtail is running
+      systemd:
+        name: promtail
+      register: promtail_status
+
+    - name: Fail if promtail is not running
+      fail:
+        msg: "Promtail is not running on {{ inventory_hostname }} — check journalctl -u promtail"
+      when: promtail_status.status.ActiveState != "active"
+
+    - name: Print status per host
+      debug:
+        msg: "{{ inventory_hostname }} — promtail {{ promtail_version }} — {{ promtail_status.status.ActiveState }}"
+
+  handlers:
+    - name: reload systemd
+      systemd:
+        daemon_reload: yes
+
+    - name: restart promtail
+      systemd:
+        name: promtail
+        state: restarted
+```
+
+---
+
+### site.yml
+
+Auditd runs first — by the time Promtail is deployed, `/var/log/audit/audit.log` already exists on every node.
+
+```yaml
+---
+- import_playbook: install_auditd.yml
+- import_playbook: install_promtail.yml
+```
+
+---
+
+### Running the Playbooks
+
+**Deploy everything:**
+```bash
+ansible-playbook -i inventory.ini site.yml --ask-vault-pass
+```
+
+**Deploy only Promtail:**
+```bash
+ansible-playbook -i inventory.ini install_promtail.yml --ask-vault-pass
+```
+
+**Deploy only Auditd:**
+```bash
+ansible-playbook -i inventory.ini install_auditd.yml --ask-vault-pass
+```
+
+**Deploy to a single new node:**
+```bash
+ansible-playbook -i inventory.ini site.yml --ask-vault-pass -l node04
+```
+
+**Idempotency test — run twice, second must show changed=0:**
+```bash
+ansible-playbook -i inventory.ini site.yml --ask-vault-pass
+ansible-playbook -i inventory.ini site.yml --ask-vault-pass
+# Second run: ok=N  changed=0  failed=0 on all hosts
+```
+
+---
+
+## Final Validation Matrix
+
+Generate each event and verify it appears in Grafana before marking done.
+
+| Event | Command | Grafana Query | Pass |
 |---|---|---|---|
-| Failed SSH | `ssh baduser@client01` from workstation | `{log_type="auth"} \|= "Failed password"` | [ ] |
-| Successful SSH | `ssh youruser@client01` from workstation | `{log_type="auth"} \|= "Accepted"` | [ ] |
-| Sudo command | `sudo ls /root` on client01 | `{log_type="auth"} \|= "COMMAND"` | [ ] |
-| User creation | `sudo useradd finaltest` on client01 | `{log_type="audit"} \|= "user_modification"` | [ ] |
-| Sudoers change | `sudo touch /etc/sudoers.d/ztest && sudo rm /etc/sudoers.d/ztest` | `{log_type="audit"} \|= "sudoers_modification"` | [ ] |
-| PostgreSQL auth fail | `psql -U nobody -d postgres` | `{service="postgresql"} \|= "authentication failed"` | [ ] |
-| Slow query | `sudo -u postgres psql -c "SELECT pg_sleep(1.5);"` | `{service="postgresql"} \|= "duration"` | [ ] |
-| Nginx 404 | `curl http://client02/doesnotexist` | `{service="nginx"} \| json \| status == 404` | [ ] |
-| System log | `logger "test validation"` on any client | `{log_type="system"} \|= "test validation"` | [ ] |
+| Failed SSH | `ssh baduser@node01` from workstation | `{log_type="auth"} \|= "Failed password"` | [ ] |
+| Successful SSH | `ssh youruser@node01` from workstation | `{log_type="auth"} \|= "Accepted"` | [ ] |
+| Sudo command | `sudo ls /root` on node01 | `{log_type="auth"} \|= "COMMAND"` | [ ] |
+| User creation | `sudo useradd finaltest` on node01 | `{log_type="audit", audit_key="user_mgmt"}` | [ ] |
+| User deletion | `sudo userdel finaltest` on node01 | `{log_type="audit", audit_key="user_mgmt"}` | [ ] |
+| Sudoers change | `sudo touch /etc/sudoers.d/ztest && sudo rm /etc/sudoers.d/ztest` | `{log_type="audit", audit_key="sudoers_modification"}` | [ ] |
+| SSH config touch | `sudo touch /etc/ssh/sshd_config` | `{log_type="audit", audit_key="ssh_config"}` | [ ] |
+| Priv command | `sudo ls /root` | `{log_type="audit", audit_key="priv_cmd"}` | [ ] |
+| System log | `logger "test validation"` on any node | `{log_type="system"} \|= "test validation"` | [ ] |
 
-Clean up:
+Clean up after validation:
 ```bash
-sudo userdel finaltest
+sudo userdel finaltest 2>/dev/null || true
 sudo rm -f /etc/sudoers.d/ztest
 ```
 
 ---
 
-## Known Issues to Fix Later
+## Known Gaps — Fix in Phase 2
 
-| Gap | Risk | Fix When |
+| Gap | Risk | Fix |
 |---|---|---|
-| No alerting | Failed SSH brute force generates no notification | Phase 2 — Grafana alerting |
-| Plaintext log transport | Log content visible on network | Phase 2 — TLS between Promtail and Loki |
-| No auth on Loki push endpoint | Any internal host can push fake logs | Phase 2 — nginx with basic auth in front of Loki |
-| Grafana on HTTP | Sessions exposed | Phase 2 — nginx + TLS |
-| No Loki data backup | Disk failure = data loss | Phase 2 — scheduled backup of `/var/lib/loki` |
-| `-e 2` not set on auditd | Audit rules can be modified without a reboot | After rules are stable and tested |
+| Promtail runs as root on Ubuntu 24.04 | Binary ignores `User=` directive — mitigated with systemd hardening | Investigate newer Promtail version |
+| No alerting | SSH brute force generates no notification | Grafana alerting rules on `count_over_time` thresholds |
+| Plaintext log transport | Log content visible on the network | TLS between Promtail and Loki |
+| No auth on Loki push endpoint | Any internal host can push logs | nginx with basic auth in front of port 3100 |
+| Grafana on HTTP | Sessions exposed | nginx + TLS termination |
+| No Loki data backup | Disk failure = full data loss | Scheduled backup of `/var/lib/loki` |
+| Auditd `-e 2` not set | Rules can be modified without reboot | Enable after rules are stable and tested |
 
 ---
 
 ## LogQL Quick Reference
 
 ```logql
-{hostname="client01"}
+{hostname="node01"}
 {log_type="auth"} |= "Failed password"
 {log_type="auth"} |= "Accepted publickey"
 {log_type="auth"} |= "COMMAND"
 {log_type="audit", audit_key="user_modification"}
-{log_type="audit"} |= "sudoers_modification"
-{service="postgresql"} |= "ERROR"
-{service="postgresql"} |= "authentication failed"
-{service="nginx"} | json | status >= 400
-{service="nginx"} | json | status >= 500
+{log_type="audit", audit_key="user_mgmt"}
+{log_type="audit", audit_key="sudoers_modification"}
+{log_type="audit", audit_key="priv_cmd"}
+{log_type="audit", audit_key="ssh_config"}
 count_over_time({log_type="auth"} |= "Failed password" [24h])
 sum(rate({log_type="auth"} |= "Failed password" [$__interval]))
-{hostname="$hostname", log_type="auth"} |= "Failed password"
+{hostname="$hostname", log_type="$log_type"}
 ```
+
