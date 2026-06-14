@@ -496,29 +496,45 @@ sudo tail -5 /var/log/audit/audit.log
 
 ### Step 11 — Write Audit Rules
 
-```bash
+```
 sudo tee /etc/audit/rules.d/logging-platform.rules > /dev/null << 'EOF'
+
 ## Clear existing rules
+
 -D
 
 ## Buffer size — prevents dropped events under load
+
 -b 8192
 
 ## Backlog wait time
+
 --backlog_wait_time 60000
 
-## Failure mode: 1 = silent, 2 = panic. Use 1 in production.
+## Failure mode
+
+## 0 = silent
+
+## 1 = printk
+
+## 2 = panic
+
 -f 1
 
-## User and group file changes
+## =====================================================
+
+## USER / GROUP MANAGEMENT
+
+## =====================================================
+
 -w /etc/passwd -p wa -k user_modification
 -w /etc/shadow -p wa -k user_modification
 -w /etc/group -p wa -k group_modification
 -w /etc/gshadow -p wa -k group_modification
+
 -w /etc/sudoers -p wa -k sudoers_modification
 -w /etc/sudoers.d/ -p wa -k sudoers_modification
 
-## User management commands
 -w /usr/sbin/useradd -p x -k user_mgmt
 -w /usr/sbin/userdel -p x -k user_mgmt
 -w /usr/sbin/usermod -p x -k user_mgmt
@@ -526,25 +542,93 @@ sudo tee /etc/audit/rules.d/logging-platform.rules > /dev/null << 'EOF'
 -w /usr/sbin/groupdel -p x -k user_mgmt
 -w /usr/sbin/passwd -p x -k user_mgmt
 
-## SSH config changes
--w /etc/ssh/sshd_config -p wa -k ssh_config
+## =====================================================
 
-## Systemd service changes
+## SSH MONITORING
+
+## =====================================================
+
+-w /etc/ssh/sshd_config -p wa -k ssh_config
+-w /etc/ssh/ssh_config -p wa -k ssh_config
+
+-w /root/.ssh/authorized_keys -p wa -k ssh_key_change
+
+## =====================================================
+
+## SYSTEMD / SERVICE PERSISTENCE
+
+## =====================================================
+
 -w /etc/systemd/system/ -p wa -k service_modification
 
-## Cron changes
+-a always,exit -F path=/usr/bin/systemctl -F perm=x -F auid>=1000 -F auid!=-1 -k service_control
+
+## =====================================================
+
+## CRON PERSISTENCE
+
+## =====================================================
+
 -w /etc/cron.d/ -p wa -k cron_modification
 -w /var/spool/cron/ -p wa -k cron_modification
 
-## Privileged command execution
+-a always,exit -F path=/usr/bin/crontab -F perm=x -F auid>=1000 -F auid!=-1 -k cron_activity
+
+## =====================================================
+
+## STARTUP PERSISTENCE
+
+## =====================================================
+
+-w /etc/rc.local -p wa -k startup_modification
+
+## =====================================================
+
+## PRIVILEGED COMMAND EXECUTION
+
+## =====================================================
+
 -a always,exit -F path=/usr/bin/sudo -F perm=x -F auid>=1000 -F auid!=-1 -k priv_cmd
+
 -a always,exit -F path=/usr/bin/su -F perm=x -F auid>=1000 -F auid!=-1 -k priv_cmd
 
-## DO NOT enable immutable mode until rules are finalised
-## -e 2
-EOF
-```
+## =====================================================
 
+## AUDITD PROTECTION
+
+## =====================================================
+
+-w /etc/audit/ -p wa -k audit_config_change
+
+-w /usr/sbin/auditctl -p x -k audit_rule_change
+-w /usr/sbin/augenrules -p x -k audit_rule_change
+
+## =====================================================
+
+## KERNEL MODULE ACTIVITY
+
+## =====================================================
+
+-w /sbin/insmod -p x -k kernel_module
+-w /sbin/rmmod -p x -k kernel_module
+-w /sbin/modprobe -p x -k kernel_module
+
+## =====================================================
+
+## OPTIONAL
+
+## Enable only after testing
+
+## Makes audit rules immutable until reboot
+
+## =====================================================
+
+## -e 2
+
+EOF
+
+
+```
 Load and verify:
 ```bash
 sudo augenrules --load
